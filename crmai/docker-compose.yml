@@ -1,0 +1,211 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: movecrm-postgres
+    environment:
+      POSTGRES_DB: movecrm
+      POSTGRES_USER: movecrm
+      POSTGRES_PASSWORD: movecrm_password
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./docs/database_schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+    networks:
+      - movecrm-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U movecrm -d movecrm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis for caching and sessions
+  redis:
+    image: redis:7-alpine
+    container_name: movecrm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - movecrm-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # SuperTokens Core for authentication
+  supertokens:
+    image: registry.supertokens.io/supertokens/supertokens-postgresql:7.0
+    container_name: movecrm-supertokens
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3567:3567"
+    environment:
+      POSTGRESQL_CONNECTION_URI: "postgresql://movecrm:movecrm_password@postgres:5432/movecrm"
+      API_KEYS: "supertokens-api-key"
+    networks:
+      - movecrm-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3567/hello"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # MoveCRM Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: movecrm-backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      supertokens:
+        condition: service_healthy
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - DATABASE_URL=postgresql://movecrm:movecrm_password@postgres:5432/movecrm
+      - REDIS_URL=redis://redis:6379/0
+      - SUPERTOKENS_CONNECTION_URI=http://supertokens:3567
+      - SUPERTOKENS_API_KEY=supertokens-api-key
+      - YOLOE_SERVICE_URL=http://yoloe-service:8001
+      - UPLOAD_FOLDER=/app/uploads
+      - MAX_CONTENT_LENGTH=52428800
+      - SECRET_KEY=dev-secret-key-change-in-production
+    volumes:
+      - ./backend:/app
+      - backend_uploads:/app/uploads
+    networks:
+      - movecrm-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # YOLOE Detection Service
+  yoloe-service:
+    build:
+      context: ./yoloe-service
+      dockerfile: Dockerfile
+    container_name: movecrm-yoloe
+    ports:
+      - "8001:8001"
+    environment:
+      - SERVICE_HOST=0.0.0.0
+      - SERVICE_PORT=8001
+      - DEBUG=true
+      - YOLOE_MODEL_PATH=yolov8n.pt
+      - CONFIDENCE_THRESHOLD=0.5
+      - IOU_THRESHOLD=0.45
+      - MAX_DETECTIONS=100
+      - DEVICE=cpu
+      - UPLOAD_DIR=/app/uploads
+      - MAX_FILE_SIZE_MB=50
+    volumes:
+      - ./yoloe-service:/app
+      - yoloe_uploads:/app/uploads
+      - yoloe_models:/app/models
+    networks:
+      - movecrm-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Frontend Development Server (optional for development)
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile.dev
+    container_name: movecrm-frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_URL=http://localhost:5000/api
+      - VITE_WIDGET_URL=http://localhost:8080
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    networks:
+      - movecrm-network
+    depends_on:
+      - backend
+
+  # Widget CDN Server (serves the embeddable widget)
+  widget-cdn:
+    image: nginx:alpine
+    container_name: movecrm-widget-cdn
+    ports:
+      - "8080:80"
+    volumes:
+      - ./widget/dist:/usr/share/nginx/html
+      - ./widget/nginx.conf:/etc/nginx/nginx.conf:ro
+    networks:
+      - movecrm-network
+
+  # MinIO for S3-compatible storage (development)
+  minio:
+    image: minio/minio:latest
+    container_name: movecrm-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - movecrm-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  # Adminer for database management (development)
+  adminer:
+    image: adminer:latest
+    container_name: movecrm-adminer
+    ports:
+      - "8082:8080"
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+    networks:
+      - movecrm-network
+    depends_on:
+      - postgres
+
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  backend_uploads:
+    driver: local
+  yoloe_uploads:
+    driver: local
+  yoloe_models:
+    driver: local
+  minio_data:
+    driver: local
+
+networks:
+  movecrm-network:
+    driver: bridge
+
